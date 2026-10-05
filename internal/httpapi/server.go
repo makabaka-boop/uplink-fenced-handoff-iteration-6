@@ -30,6 +30,7 @@ func New(s *store.Store, logger *slog.Logger) *Server {
 	mux.HandleFunc("GET /commands", srv.handleListCommands)
 	mux.HandleFunc("GET /commands/{id}", srv.handleGetCommand)
 	mux.HandleFunc("POST /commands/{id}/ack", srv.handleAck)
+	mux.HandleFunc("POST /commands/{id}/return", srv.handleReturn)
 	mux.HandleFunc("POST /commands/{id}/expire", srv.handleExpire)
 	mux.HandleFunc("POST /claims", srv.handleClaim)
 

@@ -102,6 +102,10 @@ type LeaseView struct {
 	Generation int64
 	ExpiresAt  time.Time
 	ClaimedAt  time.Time
+	// ReturnedAt 记录本代租约被“当前有效持有者主动归还”的裁决时刻；
+	// nil 表示该代租约未发生过归还（正常到期/被新一代取代不算归还）。
+	// 归还不是指令终态：它只让指令重新排队，指令本身仍可能 pending 或已结算。
+	ReturnedAt *time.Time
 }
 
 // Settlement 终态结算记录。
@@ -405,10 +409,11 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	// 给出相同结论。
 	var leaseGen int64
 	var leaseLive bool
+	var returnedAt *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT generation, (expires_at > $2)
+		SELECT generation, (expires_at > $2), returned_at
 		FROM leases
-		WHERE lease_token = $1 AND command_id = $3`, token, adjudgedAt, id).Scan(&leaseGen, &leaseLive)
+		WHERE lease_token = $1 AND command_id = $3`, token, adjudgedAt, id).Scan(&leaseGen, &leaseLive, &returnedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrInvalidLeaseToken
 	}
@@ -417,6 +422,12 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	}
 
 	if leaseGen != currentGen {
+		return ErrLeaseStale
+	}
+	// 已主动归还的令牌在归还成功的那一刻即被回收：无论它的租期名义上是否还在，
+	// 此后都不得确认送达。归还不是结算（状态仍 pending），但令牌已死，
+	// 指令的下一次有效送达只能由更高代次的新持有者完成。
+	if returnedAt != nil {
 		return ErrLeaseStale
 	}
 	if !leaseLive {
@@ -558,6 +569,156 @@ func (s *Store) Expire(ctx context.Context, id int64) error {
 	return tx.Commit(ctx)
 }
 
+// ReturnLease 是中继领取指令后发现设备暂不可用时的“主动归还本代租约”：
+// 它让仍在执行窗口内的指令重新排队（立即可被重新领取），而不是伪造 failed
+// 结算——归还不写 settlements、不翻转终态、不阻断任何后继。
+//
+// 请求携带指令编号 id、租约代次 generation 与令牌 token；只有这三者同时指向
+// “当前有效持有者”时首次归还才成立。
+//
+// 裁决与 Ack/Expire/Claim 共用同一把 commands 行锁，且裁决时刻是拿到行锁之后
+// 读取的数据库真实时钟（clock_timestamp()）：归还、回执、到期结算、重新领取的
+// 先后完全由数据库按取锁后的时钟裁决，锁等待期间跨过租约到期点/执行截止点的
+// 请求按裁决时刻判定，绝不按入队时刻判定。
+//
+// 裁决顺序（全部在同一行锁、同一裁决时刻内）：
+//  1. 指令不存在 → ErrCommandNotFound；
+//  2. 该令牌所在租约已归还过（leases.returned_at 非空）→ 幂等重放：
+//     直接返回首次归还的成功结论（优先级最高：即使指令此后已被重新领取甚至
+//     终结，相同令牌的重试都只读到首次结论），绝不改任何状态——尤其不会清掉
+//     之后可能已经存在的后继新租约（新一代行的 returned_at/凭证不受影响）；
+//  3. 指令已在终态（delivered/failed/blocked/expired）且令牌未曾归还 →
+//     ErrAlreadySettled：该裁决先于“令牌从未签发”，与 Ack 一致——终结之后的
+//     首次归还无论带什么令牌都被拒绝，且不动前驱链；
+//  4. 指令仍 pending 但令牌从未对其签发 → ErrInvalidLeaseToken；
+//  5. 声明代次与令牌代次不符，或令牌不属于当前代次 → ErrLeaseStale
+//     （被更高代次取代的旧持有者）；
+//  6. 租约在裁决时刻已到期 → ErrLeaseStale（过期租约只能由重新领取接管，
+//     不存在“过期后归还”）；
+//  7. 数据库时钟已到执行截止点 → ErrDeadlineReached（过窗指令只能由到期结算
+//     接管，归还不开放重领——重领扫描本身也会跳过它）。
+//
+// 首次归还成立时（单事务内）：
+//   - 在该代租约行写 returned_at = 裁决时刻（记录本代归还事实，幂等键即租约自身）；
+//   - 清空 commands 指向该代的有效凭证（lease_token/lease_expires_at 置 NULL），
+//     lease_generation 保持不变——下一次领取必然取得更高代次与全新令牌；
+//   - 状态保持 pending、settlements 不增行、后继链不阻断。
+func (s *Store) ReturnLease(ctx context.Context, id int64, generation int64, token string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("return begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// 首步即取指令行锁：与任何在途的领取/回执/到期/归还/创建事务串行化。
+	var status string
+	var currentGen int64
+	err = tx.QueryRow(ctx, `
+		SELECT status, lease_generation
+		FROM commands
+		WHERE id = $1
+		FOR UPDATE`, id).Scan(&status, &currentGen)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrCommandNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("return load command: %w", err)
+	}
+
+	// 裁决时刻：拿到行锁之后的数据库真实时钟。与 Ack/Expire 同一时钟域与规则——
+	// 锁等待期间跨过租约到期点/执行截止点的请求按裁决时刻判定。
+	var adjudgedAt time.Time
+	if err = tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&adjudgedAt); err != nil {
+		return fmt.Errorf("return adjudication clock: %w", err)
+	}
+
+	// 先定位租约（令牌必须确属本指令）。注意这里不能直接对陌生令牌下结论：
+	// 终结状态的裁决要先于“令牌从未签发”，与 Ack 保持一致——已终结指令的首次
+	// 归还无论带什么令牌都被拒绝。
+	var leaseGen int64
+	var returnedAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT generation, returned_at
+		FROM leases
+		WHERE lease_token = $1 AND command_id = $2`, token, id).Scan(&leaseGen, &returnedAt)
+	leaseKnown := true
+	if errors.Is(err, pgx.ErrNoRows) {
+		leaseKnown = false
+	} else if err != nil {
+		return fmt.Errorf("return load lease: %w", err)
+	}
+
+	// 幂等重放优先级最高：该令牌所在租约已归还过时，无论指令此后是被重新领取
+	// 还是已经终结，都返回首次归还的成功结论。除了不产生第二次归还事实，更关键
+	// 的是绝不触碰之后可能已被领取的后继新租约——本分支不改任何行。
+	if leaseKnown && returnedAt != nil {
+		return nil
+	}
+
+	// 首次归还：终结（delivered/failed/blocked/expired）之后的归还明确拒绝，
+	// 先于令牌/代次/到期判定，不改变前驱链、不写归还事实。
+	if status != StatusPending {
+		return ErrAlreadySettled
+	}
+	// 指令仍 pending 时，陌生令牌才归类为“从未签发”。
+	if !leaseKnown {
+		return ErrInvalidLeaseToken
+	}
+	// 请求声明的代次必须与令牌实际代次一致，且令牌代次必须仍是当前代次：
+	// 被更高代次取代的旧持有者不能归还它早已不持有的租约。
+	if generation != leaseGen || leaseGen != currentGen {
+		return ErrLeaseStale
+	}
+
+	// 租约是否仍在有效期、是否仍在执行窗口内，均以裁决时刻的数据库时钟判定。
+	var leaseLive bool
+	var deadlineAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT (l.expires_at > $2), c.deadline_at
+		FROM leases l JOIN commands c ON c.id = l.command_id
+		WHERE l.lease_token = $1 AND l.command_id = $3`, token, adjudgedAt, id).Scan(&leaseLive, &deadlineAt)
+	if err != nil {
+		return fmt.Errorf("return lease validity: %w", err)
+	}
+	if !leaseLive {
+		// 过期租约的“归还”是伪命题：领取扫描本就会把它当作失效租约跳过并发放
+		// 新一代。显式拒绝，不写归还事实、不动状态。
+		return ErrLeaseStale
+	}
+	if deadlineAt != nil && !deadlineAt.After(adjudgedAt) {
+		// 已过执行截止点：归还开放重领没有意义（重领也会跳过过窗指令），
+		// 指令只能由到期结算接管为 expired。
+		return ErrDeadlineReached
+	}
+
+	// 首次归还成立：在该代租约行落归还事实（幂等键即 (command_id, generation)
+	// 与全局唯一 lease_token；归还只可能发生一次）。
+	if _, err = tx.Exec(ctx, `
+		UPDATE leases
+		SET returned_at = $3
+		WHERE command_id = $1 AND generation = $2 AND returned_at IS NULL`,
+		id, leaseGen, adjudgedAt); err != nil {
+		return fmt.Errorf("return lease update: %w", err)
+	}
+
+	// 清空 commands 上指向该代的有效凭证：领取扫描随即重新选中该指令，
+	// 而 lease_generation 不回退——下一次领取必然 +1 取得更高代次与新令牌，
+	// 旧令牌此后既不能 Ack（Ack 侧以 returned_at 拒绝）也不能再次归还（上方重放）。
+	// 仅当当前凭证确实仍是本代令牌时清空，避免任何异常覆盖到后继新租约。
+	if _, err = tx.Exec(ctx, `
+		UPDATE commands
+		SET lease_token      = NULL,
+		    lease_expires_at = NULL,
+		    updated_at       = $3
+		WHERE id = $1 AND lease_generation = $2 AND lease_token = $4
+		  AND status = 'pending'`,
+		id, leaseGen, adjudgedAt, token); err != nil {
+		return fmt.Errorf("return command update: %w", err)
+	}
+
+	return tx.Commit(ctx)
+}
+
 // scanArgs 适配 Command 字段顺序的扫描助手。
 func scanArgs(c *Command) []any {
 	return []any{
@@ -590,7 +751,7 @@ func (s *Store) GetCommand(ctx context.Context, id int64) (*CommandDetail, error
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT generation, expires_at, claimed_at
+		SELECT generation, expires_at, claimed_at, returned_at
 		FROM leases WHERE command_id = $1
 		ORDER BY generation`, id)
 	if err != nil {
@@ -598,7 +759,7 @@ func (s *Store) GetCommand(ctx context.Context, id int64) (*CommandDetail, error
 	}
 	for rows.Next() {
 		var lv LeaseView
-		if err := rows.Scan(&lv.Generation, &lv.ExpiresAt, &lv.ClaimedAt); err != nil {
+		if err := rows.Scan(&lv.Generation, &lv.ExpiresAt, &lv.ClaimedAt, &lv.ReturnedAt); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan lease: %w", err)
 		}

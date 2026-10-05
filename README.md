@@ -13,6 +13,12 @@
   `expired`（有正式结算行、无伪造回执），并按前驱闭包规则阻断尚未送达的后继
   （根因=到期根）；截止前的成功送达不可被追改，重复到期不会制造第二次结算。
 - **不抢占新持有者结果**：旧代次令牌迟到时返回 `409`，状态不变。
+- **设备不可用可主动归还、绝不伪造失败结算**：中继领取指令后发现设备暂不可用，
+  可凭「指令编号 + 租约代次 + 令牌」主动归还本代租约。成功归还**不是终态**：
+  指令仍 `pending`、`settlements` 不增行、不阻断后继，只把指令重新开放领取；
+  下一次领取必然取得**更高代次 + 全新令牌**，被归还的旧令牌此后不得确认送达。
+  相同令牌的归还重试返回**首次归还结论（幂等）**，绝不清掉之后可能已存在的
+  后继新租约。过期、过窗或已终结的首次归还一律拒绝且不改前驱链。
 - **查询视图自洽**：`GET /commands/{id}` 在同一个 `REPEATABLE READ` 只读事务快照中
   读取指令状态、租约历史与结算记录；查询恰好跨过并发领取/回执/到期时，也绝不出现
   “旧代次状态 + 新代次租约”或“待处理 + 已结算”的拼接视图。
@@ -122,6 +128,53 @@ go test -race ./...
 `409 already_settled` → 未填写截止时刻或数据库时钟未到点 `409 deadline_not_reached`。
 成功 `200` 返回指令详情（形态与 `GET /commands/{id}` 一致）。
 
+### `POST /commands/{id}/return` — 主动归还本代租约
+
+设备暂不可用（失联、未就位等）时，中继用本入口**主动归还本代租约**，让仍在
+执行窗口内的指令重新排队，而不是伪造 `failed` 结算。请求必须同时携带本代的
+代次与令牌（编号来自路径）：
+
+请求：`{"generation": 1, "lease_token": "…"}`
+
+- 归还**不是终态**：成功后指令仍为 `pending`，`settlements` 不增行，也不阻断
+  任何后继；只清空指令上指向本代的有效凭证（当前租约指针置空），`lease_generation`
+  不回退——指令**立即重新开放领取**，下一次领取必然取得**更高代次（+1）与全新
+  令牌**。
+- 被归还的旧令牌此后**不得确认送达**（即使其名义租期尚未到期）：回执返回
+  `409 lease_expired`。
+- **幂等重放**：相同令牌的归还重试返回首次归还的成功结论（`200`）。即使之后
+  指令已被重新领取、甚至已终结，重试都只读到首次结论，绝不产生第二次归还事实，
+  更**不会清掉后继的新租约**（新一代凭证不受影响）。
+- 只有「指令仍 `pending` + 令牌确属本指令 + 代次一致且为当前代次 + 租约未到期 +
+  数据库时钟仍早于执行截止点」的**当前有效持有者**才能完成首次归还。
+- 裁决在指令行锁内、以**取锁后的数据库时钟**完成，与领取/回执/到期结算共用同一
+  把锁与同一裁决时刻——归还、回执、到期结算、重新领取的先后完全由数据库裁决。
+- 裁决顺序：未知编号 `404 unknown_command` → 该令牌已归还过：幂等重放 `200`
+  （优先级最高）→ 指令已在终态 `409 already_settled`（先于陌生令牌裁决）→
+  令牌从未签发 `409 invalid_lease_token` → 代次不符/非当前代次 `409 lease_expired`
+  → 租约已到期 `409 lease_expired` → 已过执行截止点 `409 deadline_reached`。
+  所有拒绝路径都不写归还事实、不改状态、不动前驱链。
+- 输入校验：缺少 `generation` 为 `422 missing_generation`；非正整数
+  （字符串/浮点/布尔/0/负数）为 `422 invalid_generation`；缺少或为空令牌为
+  `422 missing_lease_token`。
+- 成功与幂等重放都返回指令详情（形态与 `GET /commands/{id}` 一致）。被归还那一代
+  的 `leases[i].returned_at` 记录裁决时刻，其余代为 `null`。
+- `200` 示例（归还后、重领前）：
+
+  ```json
+  {
+    "id": 1,
+    "payload": {"seq": 1},
+    "status": "pending",
+    "lease_generation": 1,
+    "current_lease_expires_at": null,
+    "leases": [
+      {"generation": 1, "claimed_at": "…", "expires_at": "…", "returned_at": "…"}
+    ],
+    "settlement": null
+  }
+  ```
+
 ### `POST /claims` — 原子领取最早可用指令
 
 请求：`{"lease_duration_ms": 1000}`
@@ -189,9 +242,9 @@ go test -race ./...
   "created_at": "…",
   "updated_at": "…",
   "leases": [
-    { "generation": 1, "claimed_at": "…", "expires_at": "…" },
-    { "generation": 2, "claimed_at": "…", "expires_at": "…" },
-    { "generation": 3, "claimed_at": "…", "expires_at": "…" }
+    { "generation": 1, "claimed_at": "…", "expires_at": "…", "returned_at": null },
+    { "generation": 2, "claimed_at": "…", "expires_at": "…", "returned_at": "…" },
+    { "generation": 3, "claimed_at": "…", "expires_at": "…", "returned_at": null }
   ],
   "settlement": { "generation": 3, "result": "failed", "settled_at": "…" }
 }
@@ -200,8 +253,11 @@ go test -race ./...
 - 有前驱时返回 `predecessor_id`；被阻断时返回 `blocked_by`（阻断来源根编号）；
   填写截止时刻时返回 `deadline_at`。未填写/未阻断时这些字段省略（旧指令响应形态不变）。
 - 指令状态、`leases`、`settlement` 在同一个 `REPEATABLE READ` 只读事务快照中读取：
-  三者必然对应同一可解释的状态，查询跨过并发领取/回执/到期也不会拼出矛盾视图。
-- `leases` 给出**每一代领取记录**，可观察代次推进；GET 永不返回令牌原文；
+  三者必然对应同一可解释的状态，查询跨过并发领取/回执/归还/到期也不会拼出矛盾视图。
+- `leases` 给出**每一代领取记录**，可观察代次推进；`returned_at` 非 `null` 表示该代
+  租约被其当前有效持有者主动归还（记录裁决时刻）。**归还不是终态**：指令仍可能
+  `pending`（等待重新领取），详情查询照常展示归还事实，但不把它当作结算，也不因归还
+  阻断后继。GET 永不返回令牌原文；
   从未领取（含 `blocked`）时为空数组 `[]`。
 - 未结算时 `settlement` 为 `null`（`blocked` 同样为 `null`）。`expired` 是正式结算：
   `settlement = {"generation": null, "result": "expired", "settled_at": "…"}`
@@ -220,6 +276,7 @@ go test -race ./...
 | 请求体非法 JSON | `400` | `invalid_json` |
 | 租期越界（<100 或 >5000ms）/ 缺失 | `422` | `invalid_lease_duration` / `missing_lease_duration` |
 | 结果非法 / 令牌缺失 / 载荷缺失 | `422` | `invalid_result` / `missing_lease_token` / `missing_payload` |
+| 归还代次缺失 / 非正整数 | `422` | `missing_generation` / `invalid_generation` |
 | `predecessor_id` 非正整数 | `422` | `invalid_predecessor_id` |
 | 前驱编号不存在或晚于本条 | `422` | `predecessor_not_found` |
 | `deadline_at` 不是合法 RFC3339 时间字符串 | `422` | `invalid_deadline` |
@@ -243,7 +300,9 @@ go test -race ./...
   行锁扫描中逐行求值——避免“递归 CTE 先物化候选再加锁”在高并发下让两个领取者
   同时选中同一行的锁洞。
 - `leases`：每一代租约（`(command_id, generation)` 唯一，`lease_token` 全局唯一），
-  构成可观察的领取历史。`blocked` 指令从不写入租约。
+  构成可观察的领取历史。`returned_at` 非空记录该代被其当前有效持有者**主动归还**的
+  裁决时刻（每代至多一次）；归还不是指令终态，不产生结算、不阻断后继。`blocked`
+  指令从不写入租约。
 - `settlements`：以 `command_id` 为主键——即使应用层存在疏漏，数据库层面也**物理禁止
   插入第二条终态**，是“不重复结算”的最后防线。`result` 允许
   `delivered|failed|expired`；`blocked` 不产生结算行（没有伪造结算）。到期结算行
@@ -253,20 +312,22 @@ go test -race ./...
 领取在单事务内完成（行锁扫描 + 闭包/截止资格 + 代次推进 + 租约写入），
 确认在单事务内完成（行锁 + 终态裁决 + 截止点裁决 + `settlements` 插入 + 状态翻转 +
 后继链原子转 `blocked`），到期结算在单事务内完成（同一行锁 + 到点/未送达裁决 +
-`settlements` 插入 + 状态翻转 + 后继链原子转 `blocked`），创建带前驱/截止时刻的指令
-也在单事务内完成（逐行锁定整条前驱链 + 状态裁决 + 闭包写入）。
-因此创建与前驱结算交错时由数据库行锁裁决，回执与到期结算也在同一行锁下互斥，
+`settlements` 插入 + 状态翻转 + 后继链原子转 `blocked`），主动归还是单事务
+（同一行锁 + 取锁后时钟裁决当前有效持有者 + 在该代租约写 `returned_at` +
+清空当前租约指针开放重领；不写结算、不翻转终态、不阻断后继），创建带前驱/截止
+时刻的指令也在单事务内完成（逐行锁定整条前驱链 + 状态裁决 + 闭包写入）。
+因此创建、领取、归还、回执、到期结算交错时全部由同一把指令行锁裁决，
 任何崩溃/重启都不会留下“前驱已失败/到期、后继却仍可领取”，或半完成的裁决。
 
 详情查询（`GET /commands/{id}`）在 `REPEATABLE READ` 只读事务的单快照中读取
 `commands`/`leases`/`settlements` 三张表，响应内部必然自洽。所有时间戳
-（`created_at`/`claimed_at`/`expires_at`/`settled_at`/`deadline_at`）、租约有效性
-判定与截止点判定都使用数据库时钟，多实例部署时实例本地时钟偏差不参与任何裁决。
-其中裁决类判定（领取资格、回执有效性、截止点与到期判定）以**拿到指令行锁之后**
-的数据库真实时钟（`clock_timestamp()`）为裁决时刻：请求在锁队列中等待期间跨过
-时间边界的，按裁决时刻而非入队时刻判定，回执、到期结算、前驱阻断与详情视图
-因此呈现同一次有效裁决；`settled_at`/`updated_at` 记录的也是该裁决时刻，
-详情查询可与现场时间线对账。
+（`created_at`/`claimed_at`/`expires_at`/`returned_at`/`settled_at`/`deadline_at`）、
+租约有效性判定与截止点判定都使用数据库时钟，多实例部署时实例本地时钟偏差不参与任何
+裁决。其中裁决类判定（领取资格、回执有效性、主动归还资格、截止点与到期判定）以
+**拿到指令行锁之后**的数据库真实时钟（`clock_timestamp()`）为裁决时刻：请求在锁队列中
+等待期间跨过时间边界的，按裁决时刻而非入队时刻判定，归还、回执、到期结算、重新领取、
+前驱阻断与详情视图因此呈现同一次有效裁决；`returned_at`/`settled_at`/`updated_at`
+记录的也是该裁决时刻，详情查询可与现场时间线对账。
 
 ## 验收交错（`cmd/verify`）
 
@@ -298,7 +359,16 @@ go test -race ./...
     带外核对 `settlements` 恰一行；重启进程后终态与阻断保持、重复到期仍 `409`；
     **锁等待跨窗裁决**：回执/到期结算在指令行锁队列中等待期间跨过截止点
     （入队时尚未过窗），过窗回执 `409 deadline_reached`、过窗到期结算照常
-    `200 expired`——裁决以拿到锁之后的数据库时钟为准，终态不因等待顺序改变。
+    `200 expired`——裁决以拿到锁之后的数据库时钟为准，终态不因等待顺序改变；
+13. **主动归还**：输入校验（代次缺失/非法、令牌缺失、未知编号）；领取后归还
+    `200` 且状态仍 `pending`、无结算、第一代 `returned_at` 落事实、当前租约指针
+    清空但代次不回退；立即重领得更高代次+新令牌；旧令牌回执 `409 lease_expired`；
+    相同令牌归还重放 `200` 幂等且**不清后继新租约**；新持有者送达后带外核对
+    `settlements` 恰一行、仅第一代有 `returned_at`；已终结首次归还
+    `409 already_settled`、过期租约归还 `409 lease_expired`（不写归还事实）、
+    过窗归还 `409 deadline_reached`（不阻断后继，随后到期结算接管并阻断）；
+    重启后归还事实保持、旧令牌仍被拒；并发归还/回执行锁裁决后只一个结论
+    （归还开放重领 或 唯一送达结算），绝不既归还又送达。
 
 退出码 0 即全部通过。
 

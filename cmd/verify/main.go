@@ -216,6 +216,13 @@ func (v *verifier) run(ctx context.Context) error {
 		return err
 	}
 
+	// 主动归还：本代归还后重新排队（更高代次+新令牌）、旧令牌不得送达、
+	// 相同令牌归还幂等且不清后继新租约、过期/过窗/终结首次归还被拒、
+	// 唯一结算、读视图带归还事实且不把归还当终态、重启保持。
+	if err := v.checkLeaseReturns(ctx); err != nil {
+		return err
+	}
+
 	// 场景一：创建唯一指令，并发抢领。
 	status, raw := v.doJSON(ctx, http.MethodPost, "/commands", map[string]any{
 		"payload": map[string]any{
@@ -1327,6 +1334,256 @@ func (v *verifier) checkDeadlineLockQueue(ctx context.Context) error {
 			expRes.status, expRes.raw)
 	}
 	fmt.Println("deadline lock-queue checks passed (verdicts use the post-lock database clock)")
+	return nil
+}
+
+// checkLeaseReturns 验收主动归还（relinquish）的完整契约：
+//   - 输入校验：generation 缺失/非法、token 缺失 -> 422；未知编号 404；
+//   - 领取后归还：200、状态仍 pending、无结算、leases 第一代带 returned_at、
+//     当前租约指针清空但 lease_generation 不回退；
+//   - 立即重新领取：更高代次（2）+ 全新令牌；旧令牌此后 ack 409 lease_expired；
+//   - 相同令牌归还重放：200 幂等，绝不清掉后继新租约（gen-2 仍有效）；
+//   - 新持有者送达后，带外核对 settlements 恰一行、leases 第一代有 returned_at；
+//   - 终结后（另一指令）首次归还 409 already_settled；过期租约首次归还 409
+//     lease_expired；过窗归还 409 deadline_reached 且不阻断后继；
+//   - 重启后归还事实保持，旧令牌仍不能送达；
+//   - 并发归还+回执：行锁裁决后只一个结论（归还可重领 或 唯一送达结算）。
+func (v *verifier) checkLeaseReturns(ctx context.Context) error {
+	// 1) 输入校验。
+	id := v.createCommand(ctx, map[string]any{"ret": "validate"}, nil).ID
+	for _, body := range []string{
+		`{}`,
+		`{"generation":1}`,
+		`{"lease_token":"t"}`,
+		`{"generation":"1","lease_token":"t"}`,
+		`{"generation":0,"lease_token":"t"}`,
+		`{"generation":1,"lease_token":""}`,
+	} {
+		st, raw := rawPost(ctx, v, fmt.Sprintf("/commands/%d/return", id), body)
+		if st != http.StatusUnprocessableEntity {
+			return fail("invalid return %s: status=%d body=%s", body, st, raw)
+		}
+		if decode[apiError](raw).Error.Code == "" {
+			return fail("422 return must carry stable code: %s", raw)
+		}
+	}
+	if st, _ := rawPost(ctx, v, "/commands/987654321/return",
+		`{"generation":1,"lease_token":"t"}`); st != http.StatusNotFound {
+		return fail("unknown return: status=%d want 404", st)
+	}
+
+	// 2) 领取 -> 归还 -> 读视图。
+	st, raw := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK {
+		return fail("return claim: status=%d body=%s", st, raw)
+	}
+	cl := decode[claimOut](raw)
+	if cl.CommandID != id {
+		return fail("return claim got %d want %d", cl.CommandID, id)
+	}
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/return", id),
+		map[string]any{"generation": cl.Generation, "lease_token": cl.LeaseToken})
+	if st != http.StatusOK {
+		return fail("return: status=%d body=%s", st, raw)
+	}
+	after := decode[commandOut](raw)
+	if after.Status != "pending" || after.Settlement != nil {
+		return fail("return must not settle: %s", raw)
+	}
+	if after.LeaseGeneration != 1 {
+		return fail("return must not roll generation back: gen=%d", after.LeaseGeneration)
+	}
+	if len(after.Leases) != 1 || after.Leases[0]["returned_at"] == nil {
+		return fail("gen-1 return fact missing in view: %s", raw)
+	}
+	fmt.Println("lease return: pending reopens, gen-1 return fact recorded, no settlement")
+
+	// 3) 立即重领：更高代次 + 新令牌。
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK {
+		return fail("reclaim after return: status=%d body=%s", st, raw)
+	}
+	cl2 := decode[claimOut](raw)
+	if cl2.Generation != 2 || cl2.LeaseToken == cl.LeaseToken || cl2.CommandID != id {
+		return fail("reclaim must be gen=2 with fresh token on same command: %+v", cl2)
+	}
+
+	// 旧令牌不得送达。
+	if st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", id),
+		map[string]any{"lease_token": cl.LeaseToken, "result": "delivered"}); st != http.StatusConflict ||
+		decode[apiError](raw).Error.Code != "lease_expired" {
+		return fail("returned old token ack: status=%d body=%s want 409 lease_expired", st, raw)
+	}
+	// 相同令牌归还重放：200 且不清新租约。
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/return", id),
+		map[string]any{"generation": cl.Generation, "lease_token": cl.LeaseToken})
+	if st != http.StatusOK {
+		return fail("idempotent return replay: status=%d body=%s", st, raw)
+	}
+	replay := decode[commandOut](raw)
+	if replay.LeaseGeneration != 2 || replay.Leases[1]["returned_at"] != nil {
+		return fail("return replay must not clear/mark successor lease: %s", raw)
+	}
+
+	// 新持有者送达。
+	if st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", id),
+		map[string]any{"lease_token": cl2.LeaseToken, "result": "delivered"}); st != http.StatusOK {
+		return fail("gen-2 ack after return: status=%d body=%s", st, raw)
+	}
+	if err := v.assertReturnDatabase(ctx, id); err != nil {
+		return err
+	}
+
+	// 4) 已终结指令的首次归还 -> already_settled（即便带陌生令牌，终态裁决优先）。
+	if st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/return", id),
+		map[string]any{"generation": 9, "lease_token": "never-issued"}); st != http.StatusConflict ||
+		decode[apiError](raw).Error.Code != "already_settled" {
+		return fail("return on settled: status=%d body=%s want 409 already_settled", st, raw)
+	}
+
+	// 5) 过期租约首次归还 -> lease_expired，不写归还事实。
+	exp := v.createCommand(ctx, map[string]any{"ret": "expired-lease"}, nil)
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 100})
+	if st != http.StatusOK || decode[claimOut](raw).CommandID != exp.ID {
+		return fail("expired-lease claim: status=%d body=%s", st, raw)
+	}
+	expCl := decode[claimOut](raw)
+	time.Sleep(300 * time.Millisecond)
+	if st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/return", exp.ID),
+		map[string]any{"generation": expCl.Generation, "lease_token": expCl.LeaseToken}); st != http.StatusConflict ||
+		decode[apiError](raw).Error.Code != "lease_expired" {
+		return fail("expired-lease return: status=%d body=%s want 409 lease_expired", st, raw)
+	}
+	if got := v.getCommand(ctx, exp.ID); got.Status != "pending" || got.Leases[0]["returned_at"] != nil {
+		return fail("rejected expired return changed state: %+v", got)
+	}
+	if err := stReturnNoFact(ctx, v, exp.ID); err != nil {
+		return err
+	}
+	// 过期租约被拒归还后指令仍 pending 且可被重新领取：重领并送达，排空全局
+	// FIFO 队列，避免干扰后续“领取应命中指定指令”的断言。
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK || decode[claimOut](raw).CommandID != exp.ID {
+		return fail("reclaim rejected-return expired command: status=%d body=%s", st, raw)
+	}
+	expCl2 := decode[claimOut](raw)
+	if expCl2.Generation != 2 {
+		return fail("reclaim after rejected expired return must be gen=2: %+v", expCl2)
+	}
+	if st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", exp.ID),
+		map[string]any{"lease_token": expCl2.LeaseToken, "result": "delivered"}); st != http.StatusOK {
+		return fail("deliver drained expired-return command: status=%d body=%s", st, raw)
+	}
+
+	// 6) 过窗归还 -> deadline_reached，且不阻断后继；随后到期结算接管并阻断。
+	pastRoot := v.createCommandWithDeadline(ctx, map[string]any{"ret": "past-window"},
+		time.Now().Add(300*time.Millisecond))
+	pastChild := v.createCommand(ctx, map[string]any{"n": 1}, &pastRoot.ID)
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 5000})
+	if st != http.StatusOK || decode[claimOut](raw).CommandID != pastRoot.ID {
+		return fail("past-window claim: status=%d body=%s", st, raw)
+	}
+	pastCl := decode[claimOut](raw)
+	time.Sleep(500 * time.Millisecond)
+	if st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/return", pastRoot.ID),
+		map[string]any{"generation": pastCl.Generation, "lease_token": pastCl.LeaseToken}); st != http.StatusConflict ||
+		decode[apiError](raw).Error.Code != "deadline_reached" {
+		return fail("past-window return: status=%d body=%s want 409 deadline_reached", st, raw)
+	}
+	if got := v.getCommand(ctx, pastChild.ID); got.Status != "pending" || got.BlockedBy != nil {
+		return fail("rejected return must not block successors: %+v", got)
+	}
+	if st, _ = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/expire", pastRoot.ID), nil); st != http.StatusOK {
+		return fail("expire must take over after rejected return: status=%d", st)
+	}
+	if got := v.getCommand(ctx, pastChild.ID); got.Status != "blocked" {
+		return fail("successor must be blocked after expire: %s", got.Status)
+	}
+
+	// 7) 重启后归还事实保持、旧令牌仍不能送达、指令终态保持 delivered。
+	restarted, stop, err := v.spawnAPI(ctx, "18082")
+	if err != nil {
+		return err
+	}
+	defer stop()
+	got := restarted.getCommand(ctx, id)
+	if got.Status != "delivered" || got.LeaseGeneration != 2 ||
+		len(got.Leases) != 2 || got.Leases[0]["returned_at"] == nil {
+		return fail("after restart return history/state lost: %+v", got)
+	}
+	if st, raw = restarted.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", id),
+		map[string]any{"lease_token": cl.LeaseToken, "result": "delivered"}); st != http.StatusConflict {
+		return fail("old returned token ack after restart: status=%d body=%s", st, raw)
+	}
+	fmt.Println("lease return checks passed (reclaim, idempotent replay, rejections, restart)")
+	return nil
+}
+
+// rawPost 发送原始 JSON 字符串，返回状态码与原始体（verify 用）。
+func rawPost(ctx context.Context, v *verifier, path, body string) (int, []byte) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.baseURL+path, bytes.NewReader([]byte(body)))
+	if err != nil {
+		fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := v.client.Do(req)
+	if err != nil {
+		fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, raw
+}
+
+// assertReturnDatabase 带外核对归还+重领+送达后的数据库不变量：
+// 状态 delivered、settlements 恰一行、第一代租约 returned_at 非空、
+// 第二代租约 returned_at 为空。
+func (v *verifier) assertReturnDatabase(ctx context.Context, id int64) error {
+	pool, err := pgxpool.New(ctx, v.dbURL)
+	if err != nil {
+		return fmt.Errorf("db connect: %w", err)
+	}
+	defer pool.Close()
+
+	var status string
+	var settlements, returnedGen1, returnedGen2 int
+	if err := pool.QueryRow(ctx, `SELECT status FROM commands WHERE id=$1`, id).Scan(&status); err != nil {
+		return fmt.Errorf("db query command: %w", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM settlements WHERE command_id=$1`, id).Scan(&settlements); err != nil {
+		return fmt.Errorf("db query settlements: %w", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM leases WHERE command_id=$1 AND generation=1 AND returned_at IS NOT NULL`, id).Scan(&returnedGen1); err != nil {
+		return fmt.Errorf("db query gen-1 return: %w", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM leases WHERE command_id=$1 AND generation=2 AND returned_at IS NOT NULL`, id).Scan(&returnedGen2); err != nil {
+		return fmt.Errorf("db query gen-2 return: %w", err)
+	}
+	if status != "delivered" || settlements != 1 || returnedGen1 != 1 || returnedGen2 != 0 {
+		return fail("return db invariants violated: status=%s settlements=%d returned(g1)=%d returned(g2)=%d",
+			status, settlements, returnedGen1, returnedGen2)
+	}
+	return nil
+}
+
+// stReturnNoFact 带外确认某指令不存在任何归还事实。
+func stReturnNoFact(ctx context.Context, v *verifier, id int64) error {
+	pool, err := pgxpool.New(ctx, v.dbURL)
+	if err != nil {
+		return fmt.Errorf("db connect: %w", err)
+	}
+	defer pool.Close()
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM leases WHERE command_id=$1 AND returned_at IS NOT NULL`, id).Scan(&n); err != nil {
+		return fmt.Errorf("db query returns: %w", err)
+	}
+	if n != 0 {
+		return fail("command %d must have no return facts, got %d", id, n)
+	}
 	return nil
 }
 

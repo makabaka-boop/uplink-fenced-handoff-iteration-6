@@ -37,6 +37,13 @@ type ackRequest struct {
 	Result     json.RawMessage `json:"result"`
 }
 
+// returnRequest 是主动归还入口的请求体：必须同时携带本代租约的代次与令牌，
+// 编号来自路径。三者共同指向“当前有效持有者”才可能归还成功。
+type returnRequest struct {
+	Generation json.RawMessage `json:"generation"`
+	LeaseToken json.RawMessage `json:"lease_token"`
+}
+
 // parseStrictInt 仅接受 JSON 整数字面量；浮点、字符串、布尔、对象均视为非法。
 func parseStrictInt(raw json.RawMessage) (int, bool) {
 	s := strings.TrimSpace(string(raw))
@@ -79,6 +86,9 @@ type leaseViewDTO struct {
 	Generation int64     `json:"generation"`
 	ClaimedAt  time.Time `json:"claimed_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
+	// ReturnedAt 非 null 表示该代租约被其当前有效持有者主动归还（记录裁决时刻）。
+	// 归还不是指令终态：未归还的代为 null。
+	ReturnedAt *time.Time `json:"returned_at"`
 }
 
 type settlementDTO struct {
@@ -138,6 +148,7 @@ func toDetailDTO(d *store.CommandDetail) commandDetailDTO {
 	for _, l := range d.Leases {
 		dto.Leases = append(dto.Leases, leaseViewDTO{
 			Generation: l.Generation, ClaimedAt: l.ClaimedAt, ExpiresAt: l.ExpiresAt,
+			ReturnedAt: l.ReturnedAt,
 		})
 	}
 	if d.Settlement != nil {
@@ -346,6 +357,50 @@ func (s *Server) handleExpire(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.Expire(r.Context(), id); err != nil {
+		s.mapStoreError(w, r, err)
+		return
+	}
+	d, err := s.store.GetCommand(r.Context(), id)
+	if err != nil {
+		s.mapStoreError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, toDetailDTO(d))
+}
+
+// handleReturn 主动归还本代租约：只有当前有效持有者（编号+代次+令牌一致，
+// 且租约未到期、仍在执行窗口内、指令未终结）能归还。成功后指令仍 pending
+// 但立即重新开放领取（下一次领取必为更高代次+新令牌），不产生结算、不阻断后继。
+// 相同令牌的归还重试是幂等重放：返回首次归还结论，不会清掉后继新租约。
+// 成功与重放均返回指令详情（形态同 GET）。
+func (s *Server) handleReturn(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseID(w, r)
+	if !ok {
+		return
+	}
+	var req returnRequest
+	if !decodeJSONBody(w, r, &req) {
+		return
+	}
+	if len(req.Generation) == 0 {
+		writeError(w, http.StatusUnprocessableEntity, "missing_generation",
+			`field "generation" is required`)
+		return
+	}
+	gen, ok := parseStrictInt(req.Generation)
+	if !ok || gen <= 0 {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_generation",
+			`field "generation" must be a positive integer when present`)
+		return
+	}
+	token, ok := parseStrictString(req.LeaseToken)
+	if !ok || strings.TrimSpace(token) == "" {
+		writeError(w, http.StatusUnprocessableEntity, "missing_lease_token",
+			`field "lease_token" is required and must be a non-empty string`)
+		return
+	}
+
+	if err := s.store.ReturnLease(r.Context(), id, int64(gen), token); err != nil {
 		s.mapStoreError(w, r, err)
 		return
 	}
